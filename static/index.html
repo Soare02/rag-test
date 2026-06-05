@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG 检索与重排可视化控制台</title>
+    <!-- 引入 Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- 引入 FontAwesome 图标 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+    <div class="app-container">
+        <!-- 1. 左侧边栏 - 文档管理与拖拽上传 -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <i class="fa-solid fa-layer-group logo-icon"></i>
+                <h2>RAG 知识库</h2>
+            </div>
+            
+            <p class="sidebar-desc">在此处设置分块策略，并拖入新的文本文件进行自动切片分块，增量载入 Chroma 向量数据库。</p>
+            
+            <!-- 切片参数配置面板 -->
+            <div class="config-panel">
+                <div class="config-title">
+                    <i class="fa-solid fa-sliders"></i>
+                    <span>切片参数设置</span>
+                </div>
+                <div class="config-item">
+                    <label>切片方式</label>
+                    <div class="custom-select-wrapper">
+                        <div class="custom-select" id="custom-chunk-select">
+                            <div class="custom-select-trigger" data-value="recursive">递归字符切片 (Recursive)</div>
+                            <div class="custom-options">
+                                <div class="custom-option selected" data-value="recursive">递归字符切片 (Recursive)</div>
+                                <div class="custom-option" data-value="fixed">固定长度切片 (Fixed-Length)</div>
+                            </div>
+                        </div>
+                        <input type="hidden" id="chunk-method" value="recursive">
+                    </div>
+                </div>
+                <div class="config-row">
+                    <div class="config-item">
+                        <label for="chunk-size">切片长度 (字)</label>
+                        <input type="number" id="chunk-size" value="500" min="10" max="5000">
+                    </div>
+                    <div class="config-item">
+                        <label for="chunk-overlap">重叠长度 (字)</label>
+                        <input type="number" id="chunk-overlap" value="100" min="0" max="2000">
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 拖拽上传区域 -->
+            <div class="upload-zone" id="upload-zone">
+                <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
+                <p class="upload-title">拖拽文件到这里上传</p>
+                <p class="upload-subtitle">支持 .txt, .md, .pdf, .docx 格式文件</p>
+                <input type="file" id="file-input" accept=".txt,.md,.pdf,.docx" style="display: none;">
+                <button class="select-btn" onclick="document.getElementById('file-input').click()">选择本地文件</button>
+            </div>
+
+            <!-- 上传进度与状态控制台 -->
+            <div class="console-box">
+                <div class="console-header">
+                    <span><i class="fa-solid fa-terminal"></i> 运行日志</span>
+                    <button class="clear-btn" id="clear-log"><i class="fa-solid fa-trash-can"></i> 清除</button>
+                </div>
+                <div class="console-log" id="console-log">
+                    <div class="log-line system">[系统] 准备就绪。等待文档载入...</div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- 2. 主页面区 - 查询输入与效果对比 -->
+        <main class="main-content">
+            <header class="main-header">
+                <h1>RAG 智能检索与重排诊断中心</h1>
+                <div class="model-badge">
+                    <span class="badge-item"><i class="fa-solid fa-cubes"></i> Qwen3-Reranker (0.6B)</span>
+                    <span class="badge-item"><i class="fa-solid fa-brain"></i> DeepSeek-V4-Flash</span>
+                </div>
+            </header>
+
+            <!-- 检索模式切换 -->
+            <div class="mode-switch">
+                <span class="mode-label"><i class="fa-solid fa-diagram-project"></i> 检索管道</span>
+                <div class="mode-toggle" id="mode-toggle">
+                    <span class="mode-option active" data-mode="langchain"><i class="fa-solid fa-link"></i> LangChain</span>
+                    <span class="mode-option" data-mode="llamaindex"><i class="fa-solid fa-layer-group"></i> LlamaIndex</span>
+                </div>
+            </div>
+
+            <!-- 搜索框 -->
+            <section class="search-section">
+                <div class="search-wrapper">
+                    <i class="fa-solid fa-magnifying-glass search-bar-icon"></i>
+                    <input type="text" id="query-input" placeholder="输入您的问题，系统将自动展示召回、重排打分及模型回答..." autocomplete="off">
+                    <button id="search-btn" class="search-btn">
+                        <span>提问</span>
+                        <i class="fa-solid fa-paper-plane"></i>
+                    </button>
+                </div>
+            </section>
+
+            <!-- RAG 数据诊断展示区 -->
+            <div class="dashboard-grid">
+                <!-- 左半部 - RAG 检索透视（Recall vs Rerank） -->
+                <section class="diagnostic-panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <i class="fa-solid fa-chart-bar"></i>
+                            <h3>RAG 检索诊断</h3>
+                            <span class="route-badge" id="route-badge" style="display:none;"></span>
+                        </div>
+                        <div class="tabs-header">
+                            <button class="tab-btn active" data-tab="tab-rerank">精排重排 (Top 10)</button>
+                            <button class="tab-btn" data-tab="tab-recall">原始向量召回 (Top 10)</button>
+                        </div>
+                    </div>
+
+                    <div class="tab-content" id="tab-rerank">
+                        <div class="intro-alert">
+                            <i class="fa-solid fa-circle-info"></i>
+                            <span>以下是经过 <strong>qwen3-reranker-0.6b</strong> 交叉编码器精排排序后的文本，序号 1-3 将作为生成上下文喂给大模型。</span>
+                        </div>
+                        <div class="chunks-list" id="reranked-list">
+                            <div class="empty-state">
+                                <i class="fa-solid fa-inbox"></i>
+                                <p>暂无数据，请在上方输入问题并检索</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="tab-content hidden" id="tab-recall">
+                        <div class="intro-alert">
+                            <i class="fa-solid fa-circle-info"></i>
+                            <span>以下是直接从 <strong>Chroma 向量数据库</strong> 召回的最邻近候选文本块，尚未经过任何重排，包含了潜在的相关噪音。</span>
+                        </div>
+                        <div class="chunks-list" id="recalled-list">
+                            <div class="empty-state">
+                                <i class="fa-solid fa-inbox"></i>
+                                <p>暂无数据，请在上方输入问题并检索</p>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 右半部 - 大模型回答效果 -->
+                <section class="answer-panel">
+                    <div class="panel-header">
+                        <div class="panel-title">
+                            <i class="fa-solid fa-comment-dots"></i>
+                            <h3>DeepSeek 回答</h3>
+                        </div>
+                        <div class="status-indicator" id="status-indicator">
+                            <span class="status-dot"></span>
+                            <span class="status-text">空闲</span>
+                        </div>
+                    </div>
+
+                    <div class="answer-body">
+                        <!-- 回答内容容器 -->
+                        <div class="answer-output-wrapper">
+                            <div class="deepseek-header">
+                                <i class="fa-solid fa-robot ds-avatar"></i>
+                                <div class="ds-meta">
+                                    <span class="ds-name">DeepSeek-V4-Flash</span>
+                                    <span class="ds-desc">RAG 生成助手</span>
+                                </div>
+                            </div>
+                            <div class="answer-text" id="answer-text">
+                                <div class="empty-answer">
+                                    <i class="fa-solid fa-terminal"></i>
+                                    <p>等待查询触发...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- 文本块详情弹窗 (Modal) -->
+    <div class="modal-overlay" id="detail-modal">
+        <div class="modal-container">
+            <div class="modal-header">
+                <h3>文本块详细原文</h3>
+                <button class="close-modal-btn" id="close-modal"><i class="fa-solid fa-xmark"></i></button>
+            </div>
+            <div class="modal-meta-row">
+                <span class="modal-badge-item" id="modal-chunk-source">来源: 未知</span>
+                <span class="modal-badge-item highlight" id="modal-chunk-score">相似度评分: N/A</span>
+            </div>
+            <div class="modal-body">
+                <pre id="modal-chunk-content"></pre>
+            </div>
+        </div>
+    </div>
+    <script src="/static/script.js?v=4"></script>
+</body>
+</html>

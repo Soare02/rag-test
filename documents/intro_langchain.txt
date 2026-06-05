@@ -1,0 +1,17 @@
+LangChain 是一个用于构建大语言模型（LLM）应用的框架。它提供了模块化的组件，让开发者可以轻松地组合 LLM、提示词模板、向量数据库、代理等工具。
+
+LangChain 的核心概念包括：
+
+1. LCEL（LangChain Expression Language）：一种声明式的语言，用于将不同的组件组合成链。使用 | 操作符可以轻松地将提示词、模型和输出解析器串联起来。
+
+2. 代理（Agent）：代理是能够自主决策的组件。它可以根据用户输入决定调用哪些工具、如何调用，以及如何解释工具的输出。
+
+3. 向量存储（Vector Store）：用于存储文档的向量表示，支持语义搜索。常见的向量数据库包括 Chroma、FAISS、Pinecone 等。
+
+4. 提示词模板（Prompt Template）：用于管理和格式化发送给 LLM 的提示词，支持变量注入。
+
+5. 文档加载器（Document Loader）：用于从各种来源加载文档，如文本文件、PDF、网页等。
+
+LangChain 支持多种 LLM 提供商，包括 OpenAI、DeepSeek、Anthropic、Google 等。通过统一的接口，开发者可以轻松切换不同的模型提供商。
+
+RAG（Retrieval-Augmented Generation）是一种常见的 LLM 应用模式。它通过检索相关文档来增强 LLM 的生成能力，使模型能够基于用户提供的知识库来回答问题，从而减少幻觉。
