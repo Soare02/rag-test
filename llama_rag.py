@@ -1,7 +1,6 @@
 import os
 import sys
-import math
-from typing import Any, List, Optional, Generator, AsyncGenerator
+from typing import List, Generator, AsyncGenerator
 from dotenv import load_dotenv
 import chromadb
 from openai import OpenAI as OpenAI_client, AsyncOpenAI
@@ -18,9 +17,8 @@ from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.llms import LLM, ChatMessage, CompletionResponse
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.query_engine import RouterQueryEngine, RetrieverQueryEngine
+from llama_index.core.query_engine import RouterQueryEngine
 from llama_index.core.retrievers import BaseRetriever, VectorIndexRetriever
-from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 # Reuse the LMStudioReranker from rag.py for semantic reranking
@@ -42,6 +40,14 @@ CHROMA_DIR = "./chroma_db"
 DOCS_DIR = "./documents"
 LLAMA_STORAGE_DIR = "./llama_storage"
 CHROMA_COLLECTION = "llamaindex"
+# 送入 reranker 打分的单段文本上限（判相关性无需全文，避免大段文本拖慢导致超时降级）
+RERANK_MAX_CHARS = 1500
+
+
+# Reranker 接受的轻量文档对象（仅需 page_content 属性）
+class _RerankDoc:
+    def __init__(self, text):
+        self.page_content = text
 
 
 # ===== 1. Custom Embedding (LM Studio via OpenAI-compatible API) =====
@@ -543,31 +549,26 @@ def hybrid_query_with_details(question, vector_index, top_k=6):
             "score": node.score,
         })
 
-    # Rerank: pass RRF-fused results through Qwen3-Reranker for semantic scoring
+    # Rerank: pass RRF-fused results through Qwen3-Reranker for semantic scoring.
+    # 送 reranker 打分用截断文本（避免大段拖慢超时），展示与生成用原文。
     reranker = LMStudioReranker(model=RERANK_MODEL, base_url=RERANK_BASE_URL, top_n=3)
-    # Convert nodes to LangChain-compatible doc objects for the reranker
-    class _DummyDoc:
-        def __init__(self, text):
-            self.page_content = text
-    dummy_docs = [_DummyDoc(n.node.text) for n in nodes]
+    dummy_docs = [_RerankDoc(n.node.text[:RERANK_MAX_CHARS]) for n in nodes]
     scored = reranker.rerank_with_scores(question, dummy_docs)
 
     reranked_chunks = []
     top_docs_text = []
     for rank, (orig_idx, score, doc) in enumerate(scored):
+        full_text = nodes[orig_idx].node.text  # 原文，非截断
         reranked_chunks.append({
             "rank": rank + 1,
             "original_index": orig_idx + 1,
-            "content": doc.page_content,
+            "content": full_text,
             "source": recalled_chunks[orig_idx]["source"] if orig_idx < len(recalled_chunks) else "unknown",
             "score": "N/A (服务异常，已自动降级)" if score == -1.0 else score,
         })
         if rank < 3:
-            top_docs_text.append(doc.page_content)
+            top_docs_text.append(full_text)
 
-    # Build query engine using the reranked top-3 docs directly
-    from llama_index.core.schema import TextNode
-    top_nodes = [TextNode(text=t) for t in top_docs_text]
     response = Settings.llm.complete(
         f"根据以下上下文回答问题。\n\n上下文：\n{' '.join(top_docs_text)}\n\n问题：{question}\n\n请用中文简洁地回答。"
     )
@@ -599,17 +600,20 @@ def router_query_with_details(question, vector_index, summary_index, keyword_ind
     selected_name = choices[selected_idx][0]
 
     # 2. Retrieve from the selected index
-    indices = [vector_index, summary_index, keyword_index]
-    index = indices[selected_idx]
+    def _retrieve_from(idx):
+        index = [vector_index, summary_index, keyword_index][idx]
+        if idx == 0:  # vector
+            return VectorIndexRetriever(index=index, similarity_top_k=top_k).retrieve(question)[:top_k]
+        # summary / keyword 共用默认 retriever
+        return index.as_retriever().retrieve(question)[:top_k]
 
-    if selected_idx == 0:  # vector
-        retriever = VectorIndexRetriever(index=index, similarity_top_k=top_k)
-    elif selected_idx == 1:  # summary
-        retriever = index.as_retriever()
-    else:  # keyword
-        retriever = index.as_retriever()
+    nodes = _retrieve_from(selected_idx)
 
-    nodes = retriever.retrieve(question)[:top_k]
+    # 空命中兜底：选中的索引（如 keyword 未匹配）无结果时，回退到向量检索，保证有上下文
+    if not nodes and selected_idx != 0:
+        print(f"路由 {selected_name} 无命中，回退到 vector_tool 检索。")
+        nodes = _retrieve_from(0)
+        selected_name = f"{selected_name} → vector_tool (兜底)"
 
     # 3. Build recalled_chunks (raw retrieval results)
     recalled_chunks = []
@@ -621,26 +625,24 @@ def router_query_with_details(question, vector_index, summary_index, keyword_ind
             "score": node.score,
         })
 
-    # 4. Reranker: Qwen3-Reranker semantic rescoring
+    # 4. Reranker: 截断送打分，原文展示与生成
     reranker = LMStudioReranker(model=RERANK_MODEL, base_url=RERANK_BASE_URL, top_n=3)
-    class _DummyDoc:
-        def __init__(self, text):
-            self.page_content = text
-    dummy_docs = [_DummyDoc(n.node.text) for n in nodes]
+    dummy_docs = [_RerankDoc(n.node.text[:RERANK_MAX_CHARS]) for n in nodes]
     scored = reranker.rerank_with_scores(question, dummy_docs)
 
     reranked_chunks = []
     top_docs_text = []
     for rank, (orig_idx, score, doc) in enumerate(scored):
+        full_text = nodes[orig_idx].node.text  # 原文，非截断
         reranked_chunks.append({
             "rank": rank + 1,
             "original_index": orig_idx + 1,
-            "content": doc.page_content,
+            "content": full_text,
             "source": recalled_chunks[orig_idx]["source"] if orig_idx < len(recalled_chunks) else "unknown",
             "score": "N/A (服务异常，已自动降级)" if score == -1.0 else score,
         })
         if rank < 3:
-            top_docs_text.append(doc.page_content)
+            top_docs_text.append(full_text)
 
     # 5. DeepSeek generation from top 3
     response = Settings.llm.complete(

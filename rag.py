@@ -75,6 +75,8 @@ class LMStudioReranker:
         }
 
         try:
+            # timeout 15s：正常块 2-3s 足够；个别"毒块"会让 reranker 推理卡死，
+            # 15s 后快速失败并由 rerank_with_scores 跳过该块（不拖垮整批）。
             resp = requests.post(url, json=payload, timeout=15)
             if resp.status_code != 200:
                 err_msg = resp.json().get("error", "") if resp.headers.get("content-type", "").startswith("application/json") else resp.text
@@ -132,26 +134,35 @@ class LMStudioReranker:
     def rerank_with_scores(self, query: str, documents: list) -> list:
         """对文档列表进行重排并返回每个文档的分数信息。
         返回格式: [(index, score, doc), ...] 按分数从高到低排列。
-        若模型接口不可用或返回异常分(-1.0)，则会自动平滑回退，保留原始排序并给出降级标识得分。
+
+        容错策略（逐块独立）：
+        - 单块评分失败（如某些文本让 reranker 模型推理卡死/超时）→ 该块标记 -1.0 排到最后，
+          不影响其余块的正常精排（避免"一个毒块拖垮整批降级"）。
+        - 仅当所有块都失败（reranker 服务整体不可用/未启动）→ 整批降级，保留原始顺序。
         """
         if not documents:
             return []
 
         scored = []
-        has_error = False
+        error_count = 0
 
         for i, doc in enumerate(documents):
             score = self._score_single(query, doc.page_content)
-            if score < 0.0:  # 发生接口异常或网络超时错误
-                has_error = True
-                break
-            scored.append((i, score, doc))
+            if score < 0.0:  # 该块接口异常或超时
+                error_count += 1
+                scored.append((i, -1.0, doc))  # 标记失败，不中断其余块
+            else:
+                scored.append((i, score, doc))
 
-        # 兜底降级处理：如果接口调用中有任何一处发生错误或不可用，触发 Fallback
-        if has_error or not scored:
-            print("Reranker: 检测到接口异常或未启动，触发 Fallback 降级（原序列相似度排序）")
+        # 仅当全部失败才视为服务整体异常，整批降级
+        if error_count == len(documents):
+            print("Reranker: 全部评分失败，触发整批 Fallback 降级（reranker 服务可能未启动）。")
             return [(i, -1.0, doc) for i, doc in enumerate(documents)]
 
+        if error_count > 0:
+            print(f"Reranker: {error_count}/{len(documents)} 块评分失败（超时/卡死），已降级排后，其余正常精排。")
+
+        # 成功块按分降序，失败块(-1.0)自然排到最后
         scored.sort(key=lambda x: (-x[1], x[0]))
         return scored
 

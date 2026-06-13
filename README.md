@@ -110,13 +110,22 @@ uv run python agent.py   # 圣地巡礼规划助手
 | 生成 | DeepSeek-V4-Flash | DeepSeek-V4-Flash |
 | 路由策略 | 固定向量检索 | LLM 根据意图自动选择索引 |
 
+## 容错机制
+
+- **Reranker 单块容错**：个别文本块可能让 reranker 模型推理卡死/超时。系统对每个块**独立打分**，单块失败（标记 `-1.0`）只把该块排到末尾，不影响其余块的正常精排；仅当**所有块**都失败（reranker 服务未启动）才整批降级保留原始顺序。
+- **路由空命中兜底**：LlamaIndex 模式下若路由选中的索引（如 keyword）未命中任何结果，自动回退到向量检索，保证生成始终有上下文（前端显示 `keyword_tool → vector_tool (兜底)`）。
+- **文本截断**：送入 reranker 打分的文本截断到 1500 字（判相关性足够），展示与生成仍用原文，降低超时概率。
+
 ## 常见问题
 
 **Q: 为什么 Reranker 显示"服务异常，已自动降级"？**
-A: LM Studio 未启动或 Reranker 模型未加载。请确保 LM Studio Server 在 `http://localhost:1234` 运行并加载了 `qwen3-reranker-0.6b`。
+A: 分两种情况：(1) 个别块显示降级、其余正常 → 该块让 reranker 推理超时，属正常容错，不影响整体结果；(2) **全部**块都降级 → LM Studio 未启动或 Reranker 模型未加载，请确认 LM Studio Server 在 `http://localhost:1234` 运行并加载了 `qwen3-reranker-0.6b`。建议在 LM Studio 中关闭模型自动卸载，让 embedding 与 reranker 常驻显存。
+
+**Q: LlamaIndex 模式显示"keyword_tool → vector_tool (兜底)"是报错吗？**
+A: 不是。这是正常容错：LLM 把问题路由到了关键词索引但未命中，系统自动回退到向量检索，最终结果正确。
 
 **Q: BM25 检索为什么不可用？**
-A: 项目使用 `bm25s` 库，默认空格分词器对中文无效。安装 `jieba` 后可启用中文分词支持。
+A: 项目使用 `bm25s` 库，默认空格分词器对中文无效，会自动降级为纯向量检索。安装 `jieba` 后可启用中文分词支持。
 
 **Q: LlamaIndex 索引如何重建？**
 A: 删除 `llama_storage/` 目录后重新运行 `uv run python llama_rag.py ingest`。
