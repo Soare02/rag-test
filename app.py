@@ -120,13 +120,19 @@ async def upload_file(
                 "added_count": 0
             }
             
-        vectorstore.add_documents(new_chunks)
-        
+        # Chroma 单次 upsert 硬上限约 5461 条（SQLite 绑定参数限制），分批写入。
+        CHROMA_WRITE_BATCH = 5000
+        written = 0
+        for i in range(0, len(new_chunks), CHROMA_WRITE_BATCH):
+            batch = new_chunks[i:i + CHROMA_WRITE_BATCH]
+            vectorstore.add_documents(batch)
+            written += len(batch)
+
         return {
             "status": "success",
             "message": f"文件 '{file.filename}' 处理完成，切片并增量入库成功！",
             "chunks_count": len(chunks),
-            "added_count": len(new_chunks)
+            "added_count": written
         }
         
     except Exception as e:
@@ -143,8 +149,8 @@ async def query_langchain(question: str) -> dict:
     try:
         vectorstore = get_vectorstore()
 
-        # 1. 粗回阶段：从向量库检索 k=6 个候选文本块
-        base_retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+        # 1. 粗回阶段：从向量库检索 k=20 个候选文本块
+        base_retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
         raw_docs = base_retriever.invoke(question)
 
         recalled_chunks = []

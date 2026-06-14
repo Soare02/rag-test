@@ -29,9 +29,57 @@ class LMStudioEmbeddings(Embeddings):
         self.model = model
         self.client = OpenAI(base_url=base_url, api_key="lm-studio")
 
+    # 分批参数：本地 LM Studio + Qwen3-Embedding-0.6B 的安全档。
+    # 不分批时 22MB 文档（~5 万 chunk）一次性 POST 会让服务端 OOM/超时，整批废掉。
+    EMBED_BATCH_SIZE = 32
+    EMBED_DIM = 1024  # Qwen3-Embedding-0.6B 输出维度，失败时占位向量需要对齐
+    EMBED_TIMEOUT = 60  # 单批超时（秒），避免 server 卡死无限挂起
+    EMBED_MAX_RETRIES = 3  # 单批失败重试次数，指数退避 1/2/4s
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        response = self.client.embeddings.create(input=texts, model=self.model)
-        return [item.embedding for item in response.data]
+        """分批 + 重试 + 单批容错的批量向量化。
+
+        - 把一次 N 条的请求切成 ceil(N/BATCH) 次小请求，避免显存爆 / server 超时。
+        - 单批 3 次重试仍失败 → 用零向量占位（Chroma 要求 texts 与 vectors 等长），
+          这些块永远不会被检索命中，等同软删除，不影响其他块正常入库。
+        - 每 20 批打印一次进度，22MB 这种长任务可观测。
+        """
+        import time
+
+        total = len(texts)
+        if total == 0:
+            return []
+
+        out: list[list[float]] = []
+        failed = 0
+
+        for i in range(0, total, self.EMBED_BATCH_SIZE):
+            batch = texts[i:i + self.EMBED_BATCH_SIZE]
+            last_err = None
+            for attempt in range(self.EMBED_MAX_RETRIES):
+                try:
+                    resp = self.client.embeddings.create(
+                        input=batch, model=self.model, timeout=self.EMBED_TIMEOUT
+                    )
+                    out.extend(item.embedding for item in resp.data)
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < self.EMBED_MAX_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+            else:
+                # 三次都失败 → 占位，保证维度对齐不让 Chroma 写入崩
+                print(f"  Embedding 批次 {i // self.EMBED_BATCH_SIZE + 1} "
+                      f"重试 {self.EMBED_MAX_RETRIES} 次仍失败: {last_err}")
+                out.extend([[0.0] * self.EMBED_DIM] * len(batch))
+                failed += len(batch)
+
+            done = min(i + self.EMBED_BATCH_SIZE, total)
+            batch_idx = i // self.EMBED_BATCH_SIZE
+            if batch_idx % 20 == 0 or done >= total:
+                print(f"  embed 进度 {done}/{total} (失败 {failed})")
+
+        return out
 
     def embed_query(self, text: str) -> list[float]:
         response = self.client.embeddings.create(input=text, model=self.model)
@@ -263,8 +311,21 @@ def ingest():
         print("没有新文档需要添加。")
         return
 
-    vectorstore.add_documents(new_chunks)
-    print(f"成功添加 {len(new_chunks)} 个新文本块到向量库（总切片数: {len(chunks)}）。")
+    # Chroma 单次 upsert 硬上限约 5461 条（SQLite 绑定参数限制），超过会整批拒收。
+    # 这里用 5000 留余量，分批写入；任何一批失败不会回滚已写入的批次。
+    CHROMA_WRITE_BATCH = 5000
+    total = len(new_chunks)
+    written = 0
+    for i in range(0, total, CHROMA_WRITE_BATCH):
+        batch = new_chunks[i:i + CHROMA_WRITE_BATCH]
+        try:
+            vectorstore.add_documents(batch)
+            written += len(batch)
+            print(f"  写入进度 {written}/{total}")
+        except Exception as e:
+            print(f"  写入批次 {i // CHROMA_WRITE_BATCH + 1} 失败: {e}")
+
+    print(f"成功添加 {written}/{total} 个新文本块到向量库（总切片数: {len(chunks)}）。")
 
 
 # ===== 7. 根据命令行模式执行 =====
